@@ -1,5 +1,7 @@
 package models
 
+import "encoding/json"
+
 type FlagReason struct {
 	Message    string   `json:"message"`
 	Confidence float32  `json:"confidence"`
@@ -57,4 +59,9 @@ type ProcessedFlagData struct {
 type FlagResponse struct {
 	Success bool     `json:"success"`
 	Data    FlagData `json:"data"`
+}
+
+type BatchFlagResponse struct {
+	Success bool                       `json:"success"`
+	Data    map[string]json.RawMessage `json:"data"`
 }
