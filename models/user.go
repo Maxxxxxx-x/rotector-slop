@@ -6,3 +6,7 @@ type User struct {
 	Flags    FlagResponse
 	Friends  map[string]Friend
 }
+
+type AssociatedUser struct {
+	FlaggedFriends map[string]string
+}
