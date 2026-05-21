@@ -153,33 +153,46 @@ func BatchGetRotectorUserFlags(userMap map[string]string) (map[string]models.Pro
 			return nil, fmt.Errorf("Rotector API responded with status code %d", response.StatusCode)
 		}
 
-		var rawBatchResponse map[string]models.FlagResponse
-		err = json.NewDecoder(response.Body).Decode(&rawBatchResponse)
+		var batchResponse models.BatchFlagResponse
+		err = json.NewDecoder(response.Body).Decode(&batchResponse)
 		response.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("Failed to decode body: %w", err)
 		}
 
-		for userId, rawResp := range rawBatchResponse {
-			if !rawResp.Success || rawResp.Data.FlagType == 0 {
+		if !batchResponse.Success {
+			continue
+		}
+
+		for userId, rawElement := range batchResponse.Data {
+			if string(rawElement) == "false" {
 				continue
 			}
+
+			var flagData models.FlagData
+			if err := json.Unmarshal(rawElement, &flagData); err != nil {
+				return nil, fmt.Errorf("Failed to parse nested user info for %s: %w", userId, err)
+			}
+
+			if flagData.FlagType == 0 {
+				continue
+			}
+
 			finalResult[userId] = models.ProcessedFlagData{
-				Id:                   rawResp.Data.Id,
-				FlagType:             mapFlagType(rawResp.Data.FlagType),
-				Category:             mapCategory(rawResp.Data.Category),
-				Confidence:           rawResp.Data.Confidence,
-				Reasons:              rawResp.Data.Reasons,
-				Reviewer:             rawResp.Data.Reviewer,
-				EngineVersion:        rawResp.Data.EngineVersion,
-				VersionCompatibility: rawResp.Data.VersionCompatibility,
-				IsReportable:         rawResp.Data.IsReportable,
-				IsLocked:             rawResp.Data.IsLocked,
-				QueuedAt:             formatRFC3339(rawResp.Data.QueuedAt),
-				Processed:            rawResp.Data.Processed,
-				ProcessedAt:          formatRFC3339(rawResp.Data.ProcessedAt),
-				LastUpdated:          formatRFC3339(rawResp.Data.LastUpdated),
-				MembershipBadge:      rawResp.Data.MembershipBadge,
+				Id:                   flagData.Id,
+				FlagType:             mapFlagType(flagData.FlagType),
+				Category:             mapCategory(flagData.Category),
+				Confidence:           flagData.Confidence,
+				Reasons:              flagData.Reasons,
+				EngineVersion:        flagData.EngineVersion,
+				VersionCompatibility: flagData.VersionCompatibility,
+				IsReportable:         flagData.IsReportable,
+				IsLocked:             flagData.IsLocked,
+				QueuedAt:             formatRFC3339(flagData.QueuedAt),
+				Processed:            flagData.Processed,
+				ProcessedAt:          formatRFC3339(flagData.ProcessedAt),
+				LastUpdated:          formatRFC3339(flagData.LastUpdated),
+				MembershipBadge:      flagData.MembershipBadge,
 			}
 		}
 	}
