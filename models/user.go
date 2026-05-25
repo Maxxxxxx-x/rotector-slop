@@ -1,10 +1,10 @@
 package models
 
 type User struct {
-	UserName string
-	RoleName string
-	Flags    FlagResponse
-	Friends  map[string]Friend
+	Name    string
+	Role    string
+	Flags   ProcessedFlagData
+	Friends []string
 }
 
 type AssociatedUser struct {
