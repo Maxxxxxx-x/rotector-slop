@@ -4,15 +4,24 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/Maxxxxxx-x/rotector-slop/utils"
 	"github.com/joho/godotenv"
 )
 
+type Database struct {
+	Name        string
+	MaxOpenConn int
+	MaxIdleConn int
+}
+
 type Config struct {
-	RotectorKey string
-	Groups      map[string]string
+	RotectorKey  string
+	Groups       map[string]string
+	RobloxCookie string
+	Database     Database
 }
 
 func splitGroup(groupStr string) (map[string]string, error) {
@@ -50,6 +59,31 @@ func GetFromEnv(path string) (Config, error) {
 	var config Config
 
 	config.RotectorKey = os.Getenv("ROTECTOR_API_KEY")
+	config.RobloxCookie = os.Getenv("ROBLOX_COOKIE")
+
+	maxIdleConnStr := os.Getenv("MAX_IDLE_CONN")
+	maxOpenConnStr := os.Getenv("MAX_OPEN_CONN")
+
+	maxIdleConn := 0
+	maxOpenConn := 0
+
+	if maxIdleConnStr != "" {
+		if maxIdleConn, err = strconv.Atoi(maxIdleConnStr); err != nil {
+			maxIdleConn = 0
+		}
+	}
+
+	if maxOpenConnStr != "" {
+		if maxOpenConn, err = strconv.Atoi(maxOpenConnStr); err != nil {
+			maxOpenConn = 0
+		}
+	}
+
+	config.Database = Database{
+		Name:        os.Getenv("DB_NAME"),
+		MaxIdleConn: maxIdleConn,
+		MaxOpenConn: maxOpenConn,
+	}
 
 	config.Groups, err = splitGroup(os.Getenv("GROUPS"))
 	if err != nil {
