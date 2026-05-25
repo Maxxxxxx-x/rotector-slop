@@ -1,19 +1,25 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"database/sql"
 	"fmt"
 	"log"
-	"os"
-	"runtime"
+	"maps"
 	"sync"
-	"unsafe"
 
-	"github.com/Maxxxxxx-x/rotector-slop/api"
+	"github.com/Maxxxxxx-x/rotector-slop/api/roblox"
+	"github.com/Maxxxxxx-x/rotector-slop/api/rotector"
 	"github.com/Maxxxxxx-x/rotector-slop/config"
+	"github.com/Maxxxxxx-x/rotector-slop/db"
+	"github.com/Maxxxxxx-x/rotector-slop/db/sqlc"
 	"github.com/Maxxxxxx-x/rotector-slop/models"
-	"github.com/Maxxxxxx-x/rotector-slop/services/analyzer"
+	"github.com/Maxxxxxx-x/rotector-slop/utils"
 )
+
+const TEST_USER_ID = "502726319"
+
+var dbMu sync.Mutex
 
 func main() {
 	cfg, err := config.GetFromEnv(".env")
@@ -22,227 +28,344 @@ func main() {
 		return
 	}
 
-	totalUsers := 0
-	groupMembers := make(map[string]map[string]models.User)
-
-	for id, name := range cfg.Groups {
-		fmt.Printf("Fetching members from %s(%s)\n", id, name)
-
-		userMap, err := api.GetMembersFromGroup(id, "")
-		if err != nil {
-			log.Fatal(err)
-			return
-		}
-
-		groupMembers[id] = userMap
-
-		count := len(userMap)
-		totalUsers += count
-		fmt.Printf("Fetched %d users from %s(%s)\n", count, name, id)
+	db, err := db.ConnectDB(cfg.Database)
+	if err != nil {
+		log.Fatal(err)
+		return
 	}
 
-	fmt.Printf("Total users: %d\n", totalUsers)
-	fmt.Printf("Analyzing %d groups...\n", len(groupMembers))
-	result := analyzer.AnalyzeGroups(groupMembers)
-	fmt.Printf("Analyzed all groups\n")
-
-	for groupId, members := range result.ExclusiveTo {
-		fmt.Printf("Only in %s(%s): %d\n", cfg.Groups[groupId], groupId, len(members))
-	}
-
-	groupMembers = nil
-	fmt.Printf("Group member size: %d\n", unsafe.Sizeof(groupMembers))
-	runtime.GC()
-
-	targets := make(map[string]string)
-
-	for userId, user := range result.InAllGroups {
-		targets[userId] = user.UserName
-	}
-
-	for _, group := range result.ExclusiveTo {
-		for userId, user := range group {
-			targets[userId] = user.UserName
+	for groupId, groupName := range cfg.Groups {
+		if _, err := db.CreateGroup(context.Background(), sqlc.CreateGroupParams{
+			ID:      groupId,
+			Name:    groupName,
+			Members: 0,
+		}); err != nil {
+			log.Printf("Failed to store %s(%s) to database: %v\n", groupName, groupId, err)
 		}
 	}
 
+	groupMemberList, err := fetchUsersFromGroups(cfg.RobloxCookie, cfg.Groups)
+	if err != nil {
+		log.Fatalf("Failed to get users from groups: %v", err)
+	}
+
+	categorized, uniqueUsers, err := utils.PartiitionGroups(groupMemberList)
+	if err != nil {
+		log.Fatalf("Failed to categorize users: %v", err)
+	}
+
+	var userIds []string
+	fmt.Printf("Unqiue users: %d\n", len(uniqueUsers))
+	for groupId, ids := range categorized {
+		fmt.Printf("%s(%s): %d users\n", cfg.Groups[groupId], groupId, len(ids))
+		userIds = append(userIds, ids...)
+	}
+
+	var mu sync.RWMutex
 	var wg sync.WaitGroup
-	var buildConnectionsErr error
-	var rotectorFlagsErr error
 
-	var friendGraph map[string]models.Friend
-	var flaggedUsers map[string]models.ProcessedFlagData
+	for groupId, users := range categorized {
+		for _, userId := range users {
+			user := uniqueUsers[userId]
+			groupRole := sql.NullString{
+				String: user.Role,
+				Valid:  true,
+			}
 
-	concurrencyLimit := 8
-	wg.Add(2)
+			name := sql.NullString{
+				String: user.Name,
+				Valid:  true,
+			}
+			_, err := db.GetUserById(context.Background(), userId)
+			if err == nil {
+				if err := db.FullUpdateUser(context.Background(), sqlc.FullUpdateUserParams{
+					Name:    name,
+					Role:    groupRole,
+					Groupid: groupId,
+				}); err != nil {
+					log.Printf("Failed to update user %s: %v\n", userId, err)
+				}
+				log.Printf("[UPDATE] Updated user record for %s\n", userId)
+				continue
+			} else if err == sql.ErrNoRows {
+				if _, err := db.CreateUser(context.Background(), sqlc.CreateUserParams{
+					ID:      userId,
+					Name:    name,
+					Role:    groupRole,
+					Groupid: groupId,
+				}); err != nil {
+					log.Printf("[CREATE] Failed to create user record for %s: %v\n", userId, err)
+				}
+				log.Printf("[CREATE] Created user record for %s\n", userId)
+				continue
+			} else {
+				log.Printf("Error checking user %s: %v\n", userId, err)
+			}
+
+		}
+	}
 
 	wg.Go(func() {
-		fmt.Printf("[TASK] Started fetching all connections for %d users\n", totalUsers)
-		friendGraph, buildConnectionsErr = analyzer.BuildConnections(targets, concurrencyLimit)
-		if buildConnectionsErr != nil {
-			fmt.Printf("[TASK ERROR] Connections build failed: %v\n", buildConnectionsErr)
-			return
+		err := fetchRotectorRecords(db, &mu, cfg.RotectorKey, &uniqueUsers, userIds)
+		if err != nil {
+			fmt.Printf("Failed to get flags: %v\n", err)
 		}
-		fmt.Println("[TASK] Finished fetching all connections")
 	})
 
 	wg.Go(func() {
-		fmt.Printf("[TASK] Getting rotector flags for %d users\n", totalUsers)
-		flaggedUsers, rotectorFlagsErr = api.BatchGetRotectorUserFlags(targets)
-		if rotectorFlagsErr != nil {
-			fmt.Printf("[TASK ERROR] Rotector lookup failed: %v\n", rotectorFlagsErr)
-			return
+		err := fetchFriendsFromUsers(db, &mu, cfg.RobloxCookie, &uniqueUsers, userIds)
+		if err != nil {
+			fmt.Printf("Failed to fetch friends: %v\n", err)
 		}
-		fmt.Println("[TASK] Finished rotector lookup")
 	})
 
 	wg.Wait()
 
-	if buildConnectionsErr != nil {
-		log.Fatalf("BuildConnections error: %v\n", buildConnectionsErr)
-	}
-	if rotectorFlagsErr != nil {
-		log.Fatalf("Rotector error: %v\n", rotectorFlagsErr)
+	for id, user := range uniqueUsers {
+		fmt.Printf("%s(%s) | Friends: %d\n | Flagged: %s\n", user.Name, id, len(user.Friends), user.Flags.FlagType)
 	}
 
-	fmt.Printf("[TASK] Scraping all %d connections\n", len(friendGraph))
+	var usersToQuery []string
+	newUsersToQuery := make(map[string]models.User)
 
-	friendTargets := make(map[string]string)
-	for friendId := range friendGraph {
-		if _, alreadyChecked := targets[friendId]; !alreadyChecked {
-			friendTargets[friendId] = ""
+	for userId, user := range uniqueUsers {
+		if user.Role != "" {
+			continue
 		}
+		usersToQuery = append(usersToQuery, userId)
+		newUsersToQuery[userId] = user
 	}
 
-	var flaggedFriends map[string]models.ProcessedFlagData
-	var rotectorFriendsErr error
+	err = fetchRotectorRecords(db, &mu, cfg.RotectorKey, &newUsersToQuery, usersToQuery)
+	if err != nil {
+		fmt.Printf("Failed to fetch records: %v\n", err)
+	}
 
-	if len(friendTargets) > 0 {
+	maps.Copy(uniqueUsers, newUsersToQuery)
+
+	fmt.Printf("Total users: %d\n", len(uniqueUsers))
+}
+
+func fetchUsersFromGroups(cookie string, groups map[string]string) (map[string]map[string]models.User, error) {
+	final := make(map[string]map[string]models.User)
+	if len(groups) == 0 {
+		return final, nil
+	}
+
+	for id := range groups {
+		final[id] = make(map[string]models.User)
+	}
+
+	chunkChan := make(chan roblox.GroupUserChunk, 50)
+	errChan := make(chan error, len(groups))
+
+	roblox.StreamUsersFromGroups(cookie, groups, chunkChan, errChan)
+
+	go func() {
+		for err := range errChan {
+			log.Printf("[GROUP CHUNK] %v\n", err)
+		}
+	}()
+
+	for chunk := range chunkChan {
+		maps.Copy(final[chunk.GroupId], chunk.Users)
+		fmt.Printf("[GROUP CHUNK] Fetched %d users from %s(%s)\n", len(final[chunk.GroupId]), groups[chunk.GroupId], chunk.GroupId)
+	}
+
+	return final, nil
+}
+
+func fetchFriendsFromUsers(db *db.DB, mu *sync.RWMutex, robloxCookie string, users *map[string]models.User, userIds []string) error {
+	if users == nil || *users == nil {
+		return fmt.Errorf("User ptr is nil")
+	}
+
+	if len(userIds) == 0 {
+		return nil
+	}
+
+	friendsChan := make(chan roblox.FriendChunk, 100)
+	friendsErrChan := make(chan error, 100)
+
+	roblox.StreamFriendsFromUser(robloxCookie, userIds, friendsChan, friendsErrChan)
+
+	var wg sync.WaitGroup
+
+	go func() {
+		for err := range friendsErrChan {
+			log.Printf("[FRIEND LIST ERROR] %v\n", err)
+		}
+	}()
+
+	for chunk := range friendsChan {
+		fmt.Printf("Fetched %d friends for %s\n", len(chunk.FriendIds), chunk.TargetId)
+
+		mu.Lock()
+		if user, exist := (*users)[chunk.TargetId]; exist {
+			user.Friends = append(user.Friends, chunk.FriendIds...)
+			(*users)[chunk.TargetId] = user
+		}
+		mu.Unlock()
+
+		currentFriendIds := chunk.FriendIds
+		currentId := chunk.TargetId
 		wg.Go(func() {
-			fmt.Printf("[TASK] Getting rotector fllags for %d users\n", len(friendTargets))
-			flaggedFriends, rotectorFriendsErr = api.BatchGetRotectorUserFlags(friendTargets)
-			if rotectorFlagsErr != nil {
-				fmt.Printf("[TASK ERROR] Connection Network lookup failed: %v\n", rotectorFriendsErr)
-				return
-			}
-			fmt.Println("[TASK] Finished network lookup")
-		})
-
-		wg.Wait()
-		if rotectorFriendsErr != nil {
-			log.Fatalf("Network evaluationf ailed: %v\n", rotectorFriendsErr)
-		}
-
-		fmt.Println("Merging flag data")
-		for friendId, flagData := range flaggedFriends {
-			if friendObj, exists := friendGraph[friendId]; exists {
-				friendObj.Flag = flagData
-				friendGraph[friendId] = friendObj
-			}
-		}
-	} else {
-		fmt.Println("[TASK] No connections to scan")
-	}
-
-	fmt.Println("-----  ROTECTOR SLOP  -----")
-	associationMap := make(map[string]models.AssociatedUser)
-	flaggedFriendsReport := make(map[string]models.ProcessedFlagData)
-
-	for friendId, friend := range friendGraph {
-		if friend.Flag.FlagType != "" {
-			flaggedFriendsReport[friendId] = friend.Flag
-
-			for _, coreTgtId := range friend.FriendsWith {
-				assoc, exists := associationMap[coreTgtId]
-				if !exists {
-					assoc = models.AssociatedUser{
-						FlaggedFriends: make(map[string]string),
+			for _, userId := range currentFriendIds {
+				dbMu.Lock()
+				_, err := db.GetUserById(context.Background(), userId)
+				if err != nil {
+					if err == sql.ErrNoRows {
+						if _, err := db.CreateUser(context.Background(), sqlc.CreateUserParams{
+							ID: userId,
+						}); err != nil {
+							log.Printf("[CHUNK] Failed to create user %s: %v\n", userId, err)
+						}
+					} else {
+						log.Printf("[CHUNK] Erorr checking user %s: %v\n", userId, err)
 					}
 				}
-				assoc.FlaggedFriends[friendId] = friend.Flag.FlagType
-				associationMap[coreTgtId] = assoc
-			}
-		}
-	}
 
-	writeReport := func(fileName string, users map[string]models.User) {
-		report := models.GroupReport{
-			Flagged:    make(map[string]models.ProcessedFlagData),
-			Associated: make(map[string]models.AssociatedUser),
-		}
-
-		for userId := range users {
-			if flagData, isFlagged := flaggedUsers[userId]; isFlagged {
-				report.Flagged[userId] = flagData
-			}
-			if assocData, isAssociated := associationMap[userId]; isAssociated {
-				report.Associated[userId] = assocData
-			}
-		}
-
-		fileData, err := json.MarshalIndent(report, "", "    ")
-		if err != nil {
-			fmt.Printf("[ERROR] Failed processing json allocation %s: %v\n", fileName, err)
-			return
-		}
-
-		if err := os.WriteFile(fileName, fileData, 0644); err != nil {
-			fmt.Printf("[ERROR] Writer failure tracking towards %s: %v\n", fileName, err)
-		} else {
-			fmt.Printf("[FILE] Wrote slice to %s\n", fileName)
-		}
-	}
-
-	writeReport("BothGroups.json", result.InAllGroups)
-	for groupId := range cfg.Groups {
-		writeReport(fmt.Sprintf("%s.json", groupId), result.ExclusiveTo[groupId])
-	}
-
-	friendsFileData, err := json.MarshalIndent(flaggedFriendsReport, "", "    ")
-	if err != nil {
-		fmt.Printf("[ERROR] Failed to process all flagged connections: %v\n", err)
-	} else {
-		if err := os.WriteFile("flagged_connections.json", friendsFileData, 0644); err != nil {
-			fmt.Printf("[ERROR] Write failedl: %v\n", err)
-		} else {
-			fmt.Printf("[FILE] Dumped connections to Flagged Connections")
-		}
-	}
-
-	printSummary := func(title string, users map[string]models.User) {
-		fmt.Printf("\n%s\n", title)
-
-		flaggedCount := 0
-		associatedCount := 0
-
-		fmt.Println("Flagged")
-		for userId, user := range users {
-			if flagData, isFlagged := flaggedUsers[userId]; isFlagged {
-				flaggedCount += 1
-				fmt.Printf("%s(%s)\n    Flags: %+v\n", user.UserName, userId, flagData)
-			}
-		}
-		if flaggedCount == 0 {
-			fmt.Printf("    No flagged accounts here")
-		}
-
-		fmt.Println("Associated")
-		for userId, user := range users {
-			if assocData, isAssociated := associationMap[userId]; isAssociated {
-				associatedCount += 1
-				fmt.Printf("%s(%s)\n", user.UserName, userId)
-				for friendId, flagType := range assocData.FlaggedFriends {
-					fmt.Printf("    [%s]: %s\n", friendId, flagType)
+				if _, err := db.CreateConnection(context.Background(), sqlc.CreateConnectionParams{
+					ID:     fmt.Sprintf("%s_%s", currentId, userId),
+					Source: currentId,
+					Target: userId,
+				}); err != nil {
+					log.Printf("Failed to create connection for %s: %v\n", currentId, err)
 				}
+				dbMu.Unlock()
 			}
-		}
-		if associatedCount == 0 {
-			fmt.Println("No associated accounts")
-		}
+		})
+
+		wg.Go(func() {
+			for _, userId := range currentFriendIds {
+				metadata, err := roblox.GetMetadataOfUser(robloxCookie, userId)
+				if err != nil {
+					log.Printf("[METADATA] Failed to get metdata of user %s: %v", userId, err)
+					continue
+				}
+				fmt.Printf("Fetched metadata for %s\n", userId)
+				mu.Lock()
+				user := (*users)[metadata.UserId]
+				user.Name = metadata.Username
+				(*users)[metadata.UserId] = user
+				mu.Unlock()
+
+				userName := sql.NullString{
+					String: metadata.Username,
+					Valid:  true,
+				}
+
+				dbMu.Lock()
+				if err := db.UpdateUserName(context.Background(), sqlc.UpdateUserNameParams{
+					ID:   metadata.UserId,
+					Name: userName,
+				}); err != nil {
+					log.Printf("Failed to save metadata for %s: %v\n", metadata.UserId, err)
+				}
+				dbMu.Unlock()
+			}
+		})
 	}
 
-	printSummary("Both groups", result.InAllGroups)
-	for groupId, groupName := range cfg.Groups {
-		printSummary(fmt.Sprintf("%s(%s)", groupName, groupId), result.ExclusiveTo[groupId])
+	wg.Wait()
+
+	return nil
+}
+
+func fetchRotectorRecords(db *db.DB, mu *sync.RWMutex, apiKey string, users *map[string]models.User, userIds []string) error {
+	if users == nil || *users == nil {
+		return fmt.Errorf("user ptr is nil")
 	}
+
+	if len(userIds) == 0 {
+		return nil
+	}
+
+	chunkChan := make(chan rotector.RotectorChunk, len(*users))
+	errChan := make(chan error, 100)
+
+	rotector.StreamRotectorRecords(apiKey, userIds, chunkChan, errChan)
+
+	go func() {
+		for err := range errChan {
+			log.Printf("[ROTECTOR ERROR] %v\n", err)
+		}
+	}()
+
+	for chunk := range chunkChan {
+		category := sql.NullString{
+			String: chunk.Record.Category,
+			Valid:  true,
+		}
+
+		confidence := sql.NullFloat64{
+			Float64: chunk.Record.Confidence,
+			Valid:   true,
+		}
+
+		isReportable := sql.NullInt64{
+			Int64: utils.BoolToInt64(chunk.Record.IsReportable),
+			Valid: true,
+		}
+
+		isLocked := sql.NullInt64{
+			Int64: utils.BoolToInt64(chunk.Record.IsLocked),
+			Valid: true,
+		}
+
+		reviewer := sql.NullString{
+			String: chunk.Record.Reviewer,
+			Valid:  true,
+		}
+
+		queuedAt := sql.NullString{
+			String: chunk.Record.QueuedAt,
+			Valid:  true,
+		}
+
+		processedAt := sql.NullString{
+			String: chunk.Record.ProcessedAt,
+			Valid:  true,
+		}
+
+		lastUpdated := sql.NullString{
+			String: chunk.Record.LastUpdated,
+			Valid:  true,
+		}
+
+		reasons := sql.NullString{
+			String: utils.ToJson(chunk.Record.Reasons),
+			Valid:  true,
+		}
+
+		dbMu.Lock()
+		_, err := db.CreateFlag(context.Background(), sqlc.CreateFlagParams{
+			ID:           chunk.UserId,
+			FlagType:     chunk.Record.FlagType,
+			Category:     category,
+			Confidence:   confidence,
+			Reviewer:     reviewer,
+			IsReportable: isReportable,
+			IsLocked:     isLocked,
+			QueuedAt:     queuedAt,
+			ProcessedAt:  processedAt,
+			LastUpdated:  lastUpdated,
+			Reasons:      reasons,
+		})
+		dbMu.Unlock()
+		if err != nil {
+			return err
+		}
+
+		mu.Lock()
+		if user, exists := (*users)[chunk.UserId]; exists {
+			user.Flags = chunk.Record
+			(*users)[chunk.UserId] = user
+		}
+
+		mu.Unlock()
+		fmt.Printf("[ROTECTOR CHUNK] Fetched flags for user %s\n", chunk.UserId)
+	}
+
+	return nil
 }
