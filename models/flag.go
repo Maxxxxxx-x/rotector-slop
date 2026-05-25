@@ -39,21 +39,17 @@ type FlagData struct {
 }
 
 type ProcessedFlagData struct {
-	Id                   int                   `json:"id"`
-	FlagType             string                `json:"flagType"`
-	Category             string                `json:"category"`
-	Confidence           float64               `json:"confidence"`
-	Reasons              map[string]FlagReason `json:"reasons"`
-	Reviewer             Reviewer              `json:"reviewer"`
-	EngineVersion        string                `json:"engineVersion"`
-	VersionCompatibility string                `json:"versionCompatibility"`
-	IsReportable         bool                  `json:"isReportable"`
-	IsLocked             bool                  `json:"isLocked"`
-	QueuedAt             string                `json:"queuedAt"`
-	Processed            bool                  `json:"processed"`
-	ProcessedAt          string                `json:"processedAt"`
-	LastUpdated          string                `json:"lastUpdated"`
-	MembershipBadge      MembershipBadge       `json:"membershipBadge"`
+	Id           int                   `json:"id"`
+	FlagType     string                `json:"flagType"`
+	Category     string                `json:"category"`
+	Confidence   float64               `json:"confidence"`
+	Reasons      map[string]FlagReason `json:"reasons"`
+	Reviewer     string                `json:"reviewer"`
+	IsReportable bool                  `json:"isReportable"`
+	IsLocked     bool                  `json:"isLocked"`
+	QueuedAt     string                `json:"queuedAt"`
+	ProcessedAt  string                `json:"processedAt"`
+	LastUpdated  string                `json:"lastUpdated"`
 }
 
 type FlagResponse struct {
